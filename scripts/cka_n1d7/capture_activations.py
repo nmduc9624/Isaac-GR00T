@@ -150,6 +150,14 @@ def main(args: Args) -> None:
     inference_modalities = deepcopy(loader.modality_configs)
     inference_modalities.pop("action")
     recorder = ActivationRecorder(policy.model, args.modules)
+    prunable_layers = get_prunable_module_lists(policy.model)
+    module_layer_indices = {
+        name: [
+            int(getattr(layer, "_gr00t_original_index", layer_index))
+            for layer_index, layer in enumerate(prunable_layers[name])
+        ]
+        for name in args.modules
+    }
 
     sampled_steps = []
     try:
@@ -179,6 +187,10 @@ def main(args: Args) -> None:
             "sampled_steps": sampled_steps,
             "gpu": torch.cuda.get_device_name(0),
             "torch_version": torch.__version__,
+            "module_layer_indices": module_layer_indices,
+            "cka_pruning_manifest": getattr(
+                policy.model.config, "cka_pruning_manifest", None
+            ),
         },
     )
     print(f"Saved CKA calibration activations to {Path(args.output_dir).resolve()}")

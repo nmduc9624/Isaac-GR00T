@@ -3,6 +3,11 @@
 This workflow adapts the CLP N1.5 research protocol to the different N1.7
 architecture. It does **not** reuse N1.5 layer indices.
 
+For an end-to-end Kaggle/Colab workflow, upload and run
+`notebooks/GR00T_N1D7_CKA_RECOVERY_KAGGLE.ipynb`. It includes hidden access-token
+input, guarded shell execution, baseline/CKA recovery, fair benchmarking,
+before/after CKA heatmaps and an automatically labeled conclusion.
+
 ## What is pruned in N1.7
 
 | Manifest target | N1.7 implementation | Default depth |
