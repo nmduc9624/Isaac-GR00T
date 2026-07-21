@@ -20,6 +20,7 @@ This module provides the core policy classes for running Gr00t models:
 - Gr00tSimPolicyWrapper: Wrapper for compatibility with existing Gr00t simulation environments
 """
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -105,10 +106,20 @@ class Gr00tPolicy(BasePolicy):
             embodiment_tag = EmbodimentTag.resolve(embodiment_tag)
         model_dir = Path(model_path)
 
-        # Load the pretrained model and move to target device with bfloat16 precision
+        # T4 does not support FlashAttention 2 and should run the complete policy
+        # in FP16. Keeping one dtype also avoids Half/Float LayerNorm mismatches.
+        low_vram_t4 = os.environ.get("GR00T_LOW_VRAM_T4", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        inference_dtype = torch.float16 if low_vram_t4 else torch.bfloat16
+
+        # Load the pretrained model and move it to the target device.
         model = AutoModel.from_pretrained(model_dir)
         model.eval()  # Set model to evaluation mode
-        model.to(device=device, dtype=torch.bfloat16)
+        model.to(device=device, dtype=inference_dtype)
         self.model = model
 
         # Load the processor for input/output transformation.
