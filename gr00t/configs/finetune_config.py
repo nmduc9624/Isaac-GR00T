@@ -45,6 +45,9 @@ class FinetuneConfig:
     If None, use the pre-registered modality config in `gr00t/configs/data/embodiment_configs.py`. 
     """
 
+    cka_pruning_manifest_path: str | None = None
+    """Optional CKA manifest. Full base weights are loaded before structural pruning."""
+
     # --- Model Tuning Flags ---
     tune_llm: bool = False
     """If True, fine-tune the language model (LLM) backbone during training."""
@@ -57,6 +60,9 @@ class FinetuneConfig:
 
     tune_diffusion_model: bool = True
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
+
+    tune_vlln: bool = True
+    """If True, fine-tune VL layer norm and the VL self-attention adapter."""
 
     state_dropout_prob: float = 0.2
     """
