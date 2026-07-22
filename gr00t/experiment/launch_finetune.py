@@ -128,6 +128,19 @@ if __name__ == "__main__":
     config.training.warmup_ratio = ft_config.warmup_ratio
     config.training.wandb_project = ft_config.wandb_project
 
+    low_vram_t4 = os.environ.get("GR00T_LOW_VRAM_T4", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if low_vram_t4:
+        # T4/Turing has FP16 Tensor Cores but no TF32 or native BF16 support.
+        config.training.tf32 = False
+        config.training.bf16 = False
+        config.training.fp16 = True
+        config.training.eval_bf16 = False
+
     config.data.shard_size = ft_config.shard_size
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
