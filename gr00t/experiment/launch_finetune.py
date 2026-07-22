@@ -153,6 +153,9 @@ if __name__ == "__main__":
         config.training.bf16 = False
         config.training.fp16 = True
         config.training.eval_bf16 = False
+        # AdamW materializes two full-size moment tensors after the first
+        # optimizer step and caused the observed second-step OOM at 14.5 GiB.
+        config.training.optim = type(config.training.optim)("adafactor")
         # Video decoding in worker subprocesses is fragile in hosted notebooks
         # and provides little benefit for the three-episode smoke dataset.
         config.training.dataloader_num_workers = 0
