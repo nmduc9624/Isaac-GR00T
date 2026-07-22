@@ -22,9 +22,23 @@ from pathlib import Path
 
 import tyro
 
-from gr00t.configs.base_config import get_default_config
-from gr00t.configs.finetune_config import FinetuneConfig
-from gr00t.experiment.experiment import run
+
+_LOW_VRAM_T4 = os.environ.get("GR00T_LOW_VRAM_T4", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+if _LOW_VRAM_T4:
+    # HF Trainer automatically wraps a model in DataParallel when two Kaggle
+    # T4s are visible. GR00T's nested BatchFeature inputs and batch size one are
+    # not DataParallel-safe, and DDP would duplicate rather than pool VRAM.
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0").strip() or "0"
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices.split(",", maxsplit=1)[0]
+
+from gr00t.configs.base_config import get_default_config  # noqa: E402
+from gr00t.configs.finetune_config import FinetuneConfig  # noqa: E402
+from gr00t.experiment.experiment import run  # noqa: E402
 
 
 # Make sure the user provided modality config is registered.
@@ -128,18 +142,20 @@ if __name__ == "__main__":
     config.training.warmup_ratio = ft_config.warmup_ratio
     config.training.wandb_project = ft_config.wandb_project
 
-    low_vram_t4 = os.environ.get("GR00T_LOW_VRAM_T4", "0").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    if low_vram_t4:
+    if _LOW_VRAM_T4:
+        if ft_config.num_gpus != 1:
+            raise ValueError(
+                "GR00T_LOW_VRAM_T4 requires --num-gpus 1. Multiple T4s do not "
+                "pool VRAM, and this smoke workflow intentionally disables DataParallel."
+            )
         # T4/Turing has FP16 Tensor Cores but no TF32 or native BF16 support.
         config.training.tf32 = False
         config.training.bf16 = False
         config.training.fp16 = True
         config.training.eval_bf16 = False
+        # Video decoding in worker subprocesses is fragile in hosted notebooks
+        # and provides little benefit for the three-episode smoke dataset.
+        config.training.dataloader_num_workers = 0
 
     config.data.shard_size = ft_config.shard_size
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
