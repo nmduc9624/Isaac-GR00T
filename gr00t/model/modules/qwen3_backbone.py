@@ -190,8 +190,12 @@ class Qwen3Backbone(torch.nn.Module):
                     "Install flash-attn for better performance: pip install flash-attn"
                 )
                 extra_kwargs["attn_implementation"] = "sdpa"
-        if load_bf16:
-            extra_kwargs["torch_dtype"] = torch.bfloat16
+        elif load_bf16:
+            # ``dtype`` is the current Transformers API. More importantly, keep
+            # this mutually exclusive with the T4 override above: passing BF16
+            # after FP16 used to silently put the nested Qwen model back in an
+            # unsupported/mismatched dtype.
+            extra_kwargs["dtype"] = torch.bfloat16
 
         try:
             self.model = Qwen3VLForConditionalGeneration.from_pretrained(

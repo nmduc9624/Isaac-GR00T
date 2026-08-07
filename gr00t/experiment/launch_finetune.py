@@ -127,7 +127,7 @@ if __name__ == "__main__":
 
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = ft_config.base_model_path
-    config.training.optim = "adamw_torch"
+    config.training.optim = ft_config.optim
     config.training.global_batch_size = ft_config.global_batch_size
     config.training.dataloader_num_workers = ft_config.dataloader_num_workers
     config.training.learning_rate = ft_config.learning_rate
@@ -138,6 +138,7 @@ if __name__ == "__main__":
     config.training.num_gpus = ft_config.num_gpus
     config.training.use_wandb = ft_config.use_wandb
     config.training.max_steps = ft_config.max_steps
+    config.training.lr_scheduler_total_steps = ft_config.lr_scheduler_total_steps
     config.training.weight_decay = ft_config.weight_decay
     config.training.warmup_ratio = ft_config.warmup_ratio
     config.training.wandb_project = ft_config.wandb_project
@@ -153,9 +154,18 @@ if __name__ == "__main__":
         config.training.bf16 = False
         config.training.fp16 = True
         config.training.eval_bf16 = False
-        # AdamW materializes two full-size moment tensors after the first
-        # optimizer step and caused the observed second-step OOM at 14.5 GiB.
-        config.training.optim = type(config.training.optim)("adafactor")
+        config.model.load_bf16 = False
+        # Optimizer choice affects convergence and must not change silently in
+        # a pruning comparison. Adafactor remains an explicit emergency
+        # fallback for non-LoRA smoke runs that cannot fit AdamW states.
+        use_adafactor = os.environ.get("GR00T_LOW_VRAM_T4_USE_ADAFACTOR", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if use_adafactor:
+            config.training.optim = type(config.training.optim)("adafactor")
         # Video decoding in worker subprocesses is fragile in hosted notebooks
         # and provides little benefit for the three-episode smoke dataset.
         config.training.dataloader_num_workers = 0
@@ -167,6 +177,7 @@ if __name__ == "__main__":
 
     config.training.save_only_model = ft_config.save_only_model
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
+    config.training.exact_data_resume = ft_config.exact_data_resume
     config.training.skip_weight_loading = ft_config.skip_weight_loading
 
     run(config)

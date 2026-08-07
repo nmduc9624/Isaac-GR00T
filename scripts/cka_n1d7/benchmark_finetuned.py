@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import asdict, dataclass, field
+import hashlib
 import json
 from pathlib import Path
 import random
@@ -67,18 +68,96 @@ def _flatten_ground_truth(data, action_keys):
     return np.concatenate([np.asarray(data.actions[key]) for key in action_keys], axis=-1)
 
 
-def _training_runtime(model_path: str) -> float | None:
+def _dataset_fingerprint(dataset_path: str) -> dict:
+    """Fingerprint metadata contents plus the complete file inventory.
+
+    Full video hashing is unnecessarily expensive for every benchmark. Hashing
+    all metadata bytes and every relative path/size still detects wrong suites,
+    partial downloads, and almost all accidental dataset substitutions.
+    """
+    root = Path(dataset_path)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Dataset directory does not exist: {root}")
+    digest = hashlib.sha256()
+    files = sorted(path for path in root.rglob("*") if path.is_file())
+    for path in files:
+        relative = path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(str(path.stat().st_size).encode("ascii"))
+        if relative.startswith("meta/"):
+            with path.open("rb") as file:
+                for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+    return {
+        "scheme": "metadata-content-plus-file-inventory-v1",
+        "sha256": digest.hexdigest(),
+        "file_count": len(files),
+    }
+
+
+def _training_metadata(model_path: str) -> dict | None:
     root = Path(model_path)
     if not root.is_dir():
         return None
-    states = sorted(root.rglob("trainer_state.json"), key=lambda path: path.stat().st_mtime)
-    if not states:
+    candidates = []
+    for path in root.rglob("trainer_state.json"):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            global_step = int(state.get("global_step", -1))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+        candidates.append((global_step, path, state))
+    if not candidates:
         return None
-    state = json.loads(states[-1].read_text(encoding="utf-8"))
-    for entry in reversed(state.get("log_history", [])):
-        if "train_runtime" in entry:
-            return float(entry["train_runtime"])
-    return None
+    global_step, state_path, state = max(
+        candidates,
+        key=lambda item: (
+            item[0],
+            item[1].parent == root,
+            item[1].stat().st_mtime_ns,
+        ),
+    )
+    runtime_segments = [
+        float(entry["train_runtime"])
+        for entry in state.get("log_history", [])
+        if "train_runtime" in entry
+    ]
+    runtime = sum(runtime_segments) if runtime_segments else None
+
+    model_config = {}
+    config_path = root / "config.json"
+    if config_path.is_file():
+        model_config = json.loads(config_path.read_text(encoding="utf-8"))
+    lora_export = None
+    lora_export_path = root / "gr00t_lora_export.json"
+    if lora_export_path.is_file():
+        lora_export = json.loads(lora_export_path.read_text(encoding="utf-8"))
+    contract_keys = (
+        "tune_llm",
+        "tune_visual",
+        "tune_projector",
+        "tune_diffusion_model",
+        "tune_vlln",
+        "state_dropout_prob",
+    )
+    return {
+        "trainer_state_path": state_path.relative_to(root).as_posix(),
+        "global_step": global_step,
+        "max_steps": int(state.get("max_steps", -1)),
+        "train_runtime_seconds": runtime,
+        "train_runtime_segments_seconds": runtime_segments,
+        "is_finetuned": global_step > 0,
+        "model_training_contract": {key: model_config.get(key) for key in contract_keys},
+        "lora_training_contract": (
+            {
+                key: lora_export.get(key)
+                for key in ("rank", "alpha", "dropout", "max_trainable_parameters")
+            }
+            if lora_export is not None
+            else None
+        ),
+        "lora_export": lora_export,
+    }
 
 
 def main(args: Args) -> None:
@@ -103,17 +182,17 @@ def main(args: Args) -> None:
     action_keys = loader.modality_configs["action"].modality_keys
 
     sample_specs = []
+    sampled_steps = []
     for trajectory_id in args.trajectory_ids:
         traj = loader[trajectory_id]
         for step in list(range(0, len(traj), args.sample_stride))[: args.samples_per_trajectory]:
             sample_specs.append((trajectory_id, step, traj))
+            sampled_steps.append({"trajectory_id": trajectory_id, "step": step})
     if not sample_specs:
         raise ValueError("No benchmark samples were selected")
 
     _first_trajectory_id, first_step, first_traj = sample_specs[0]
-    first_observation, _ = _prepare(
-        first_traj, first_step, loader.modality_configs, tag, loader
-    )
+    first_observation, _ = _prepare(first_traj, first_step, loader.modality_configs, tag, loader)
     with torch.inference_mode():
         for warmup_index in range(args.warmup_steps):
             _seed(args.seed + warmup_index)
@@ -137,7 +216,14 @@ def main(args: Args) -> None:
 
             pred = _flatten_prediction(prediction, action_keys)
             target = _flatten_ground_truth(data, action_keys)
+            if pred.ndim != 2 or target.ndim != 2 or pred.shape[1] != target.shape[1]:
+                raise ValueError(
+                    "Prediction/ground-truth action shapes are incompatible at "
+                    f"trajectory={trajectory_id}, step={step}: {pred.shape} versus {target.shape}"
+                )
             horizon = min(len(pred), len(target))
+            if horizon < 1:
+                raise ValueError(f"Empty action horizon at trajectory={trajectory_id}, step={step}")
             pred = pred[:horizon]
             target = target[:horizon]
             error = pred - target
@@ -146,6 +232,9 @@ def main(args: Args) -> None:
                     "trajectory_id": trajectory_id,
                     "step": step,
                     "seed": sample_seed,
+                    "prediction_horizon": len(_flatten_prediction(prediction, action_keys)),
+                    "ground_truth_horizon": len(_flatten_ground_truth(data, action_keys)),
+                    "evaluated_horizon": horizon,
                     "latency_ms": latency_ms,
                     "peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
                     "peak_reserved_gib": torch.cuda.max_memory_reserved() / 1024**3,
@@ -159,14 +248,21 @@ def main(args: Args) -> None:
     prediction_array = np.concatenate(predictions)
     ground_truth_array = np.concatenate(ground_truth)
     latencies = np.asarray([row["latency_ms"] for row in rows])
+    training_metadata = _training_metadata(args.model_path)
     module_depths = {
         name: len(layers) for name, layers in get_prunable_module_lists(policy.model).items()
     }
     summary = {
         **asdict(args),
-        "gpu": torch.cuda.get_device_name(0),
+        "gpu": torch.cuda.get_device_name(torch.device(args.device)),
+        "dataset_fingerprint": _dataset_fingerprint(args.dataset_path),
+        "sampled_steps": sampled_steps,
+        "action_keys": list(action_keys),
         "model_load_seconds": model_load_seconds,
-        "training_runtime_seconds": _training_runtime(args.model_path),
+        "training_metadata": training_metadata,
+        "training_runtime_seconds": (
+            training_metadata.get("train_runtime_seconds") if training_metadata else None
+        ),
         "parameter_count": sum(parameter.numel() for parameter in policy.model.parameters()),
         "trainable_parameter_count": sum(
             parameter.numel() for parameter in policy.model.parameters() if parameter.requires_grad

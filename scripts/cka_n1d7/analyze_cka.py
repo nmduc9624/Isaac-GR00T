@@ -26,14 +26,26 @@ class Args:
     backbone_language_prune_ratio: float = 0.40
     action_dit_prune_ratio: float = 0.50
     vl_self_attention_prune_ratio: float = 0.25
+    minimum_calibration_samples: int = 8
 
 
-def _load_layers(archive, module_name: str) -> list[np.ndarray]:
+def _load_layers(archive, module_name: str, *, expected_samples: int) -> list[np.ndarray]:
     prefix = f"{module_name}__layer_"
     keys = sorted(key for key in archive.files if key.startswith(prefix))
     if not keys:
         raise ValueError(f"No activations found for {module_name!r}")
-    return [archive[key] for key in keys]
+    layers = [archive[key] for key in keys]
+    invalid = {
+        key: list(value.shape)
+        for key, value in zip(keys, layers, strict=True)
+        if value.ndim != 2 or value.shape[0] != expected_samples or not np.isfinite(value).all()
+    }
+    if invalid:
+        raise ValueError(
+            f"Invalid {module_name} activation arrays; expected finite "
+            f"[{expected_samples}, features] tensors, got {invalid}"
+        )
+    return layers
 
 
 def _plot_matrix(matrix: np.ndarray, module_name: str, output_path: Path) -> None:
@@ -49,6 +61,11 @@ def _plot_matrix(matrix: np.ndarray, module_name: str, output_path: Path) -> Non
 
 
 def main(args: Args) -> None:
+    if args.minimum_calibration_samples < 3:
+        raise ValueError(
+            "minimum_calibration_samples must be at least 3; with two samples, "
+            "centered linear CKA is degenerate and typically equals 1 for every layer pair"
+        )
     ratios = {
         "backbone_language": args.backbone_language_prune_ratio,
         "action_dit": args.action_dit_prune_ratio,
@@ -62,25 +79,35 @@ def main(args: Args) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = json.loads((calibration_dir / "metadata.json").read_text(encoding="utf-8"))
     archive = np.load(calibration_dir / "activations.npz")
+    if metadata.get("activation_schema_version") != 2:
+        raise ValueError(
+            "CKA analysis requires activation schema v2 (one pooled row per observation). "
+            "Recapture activations with the current capture_activations.py."
+        )
+    sampled_steps = metadata.get("sampled_steps")
+    if not isinstance(sampled_steps, list) or len(sampled_steps) < args.minimum_calibration_samples:
+        observed = len(sampled_steps) if isinstance(sampled_steps, list) else 0
+        raise ValueError(
+            "CKA calibration is too small for a meaningful layer ranking: "
+            f"observed {observed}, required {args.minimum_calibration_samples}. "
+            "Use task-diverse observations; 32 or more is recommended for a report."
+        )
+    expected_samples = len(sampled_steps)
 
     modules = {}
     score_report = {"args": asdict(args), "calibration_metadata": metadata, "modules": {}}
     for module_name, prune_ratio in ratios.items():
-        layers = _load_layers(archive, module_name)
+        layers = _load_layers(archive, module_name, expected_samples=expected_samples)
         depth = len(layers)
         target_keep = max(1, int(round(depth * (1.0 - prune_ratio))))
         if module_name == "action_dit":
             target_keep = max(3, target_keep)
         adjacent_scores = consecutive_cka(layers)
-        keep_indices = select_keep_indices(
-            adjacent_scores, target_keep, module_name=module_name
-        )
+        keep_indices = select_keep_indices(adjacent_scores, target_keep, module_name=module_name)
         matrix = np.eye(depth, dtype=np.float64)
         for row in range(depth):
             for column in range(row + 1, depth):
-                matrix[row, column] = matrix[column, row] = linear_cka(
-                    layers[row], layers[column]
-                )
+                matrix[row, column] = matrix[column, row] = linear_cka(layers[row], layers[column])
         _plot_matrix(matrix, module_name, output_dir / f"cka_{module_name}.png")
         modules[module_name] = {
             "original_depth": depth,
@@ -104,6 +131,7 @@ def main(args: Args) -> None:
             "method": "adjacent_linear_cka_topk",
             "source_model": metadata["args"]["model_path"],
             "calibration_dataset": metadata["args"]["dataset_path"],
+            "calibration_dataset_fingerprint": metadata.get("dataset_fingerprint"),
             "modules": modules,
         }
     )

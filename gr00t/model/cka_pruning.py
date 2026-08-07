@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
 from torch import nn
 
 
@@ -65,9 +64,7 @@ def validate_pruning_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         if keep != sorted(set(keep)):
             raise ValueError(f"{name}.keep_indices must be sorted and unique")
         if keep[0] < 0 or keep[-1] >= original_depth:
-            raise ValueError(
-                f"{name}.keep_indices={keep} is outside [0, {original_depth - 1}]"
-            )
+            raise ValueError(f"{name}.keep_indices={keep} is outside [0, {original_depth - 1}]")
         if name == "action_dit":
             categories = {
                 "text_cross": [index for index in keep if index % 4 == 0],
@@ -143,9 +140,7 @@ def apply_pruning_manifest(model: nn.Module, manifest: dict[str, Any]) -> dict[s
 
     model.config.cka_pruning_manifest = deepcopy(manifest)
     after_parameters = sum(parameter.numel() for parameter in model.parameters())
-    depth_after = {
-        name: len(layers) for name, layers in _module_lists(model).items()
-    }
+    depth_after = {name: len(layers) for name, layers in _module_lists(model).items()}
     return {
         "parameters_before": before_parameters,
         "parameters_after": after_parameters,
@@ -173,7 +168,11 @@ def linear_cka(x: np.ndarray, y: np.ndarray) -> float:
     y_gram = _center_gram(y @ y.T)
     numerator = float(np.sum(x_gram * y_gram))
     denominator = float(np.linalg.norm(x_gram) * np.linalg.norm(y_gram))
-    return 0.0 if denominator == 0.0 else numerator / denominator
+    if denominator == 0.0:
+        return 0.0
+    # Round-off can produce values a few ulps outside the theoretical [0, 1]
+    # interval, which in turn distorts heatmap scales and ranking ties.
+    return float(np.clip(numerator / denominator, 0.0, 1.0))
 
 
 def consecutive_cka(layer_activations: list[np.ndarray]) -> list[float]:
@@ -185,15 +184,24 @@ def consecutive_cka(layer_activations: list[np.ndarray]) -> list[float]:
     ]
 
 
-def select_keep_indices(
-    scores: list[float], target_keep: int, *, module_name: str
-) -> list[int]:
+def select_keep_indices(scores: list[float], target_keep: int, *, module_name: str) -> list[int]:
     """Select high-CKA layers to remove under N1.7 topology constraints."""
     depth = len(scores) + 1
     if not 1 <= target_keep <= depth:
         raise ValueError(f"target_keep must be in [1, {depth}], got {target_keep}")
     keep = set(range(depth))
-    candidates = sorted(range(1, depth), key=lambda index: scores[index - 1], reverse=True)
+    # Retain boundary transformations whenever the budget permits. Layer zero
+    # consumes raw embeddings and the final layer feeds the downstream head;
+    # dropping either is a much stronger architectural intervention than
+    # removing a redundant interior layer.
+    protected = {0}
+    if target_keep >= 2:
+        protected.add(depth - 1)
+    candidates = sorted(
+        (index for index in range(depth) if index not in protected),
+        key=lambda index: scores[index - 1],
+        reverse=True,
+    )
 
     def topology_valid(indices: set[int]) -> bool:
         if module_name != "action_dit":

@@ -77,14 +77,16 @@ def _draw(
     baseline_lookup = {original: position for position, original in enumerate(baseline_indices)}
     missing = [index for index in optimized_indices if index not in baseline_lookup]
     if missing:
-        raise ValueError(f"{module_name}: optimized original indices missing in baseline: {missing}")
+        raise ValueError(
+            f"{module_name}: optimized original indices missing in baseline: {missing}"
+        )
     retained_positions = [baseline_lookup[index] for index in optimized_indices]
     baseline_retained = baseline[np.ix_(retained_positions, retained_positions)]
     delta = optimized - baseline_retained
 
     figure, axes = plt.subplots(1, 3, figsize=(18, 5.5), constrained_layout=True)
     baseline_image = axes[0].imshow(baseline, vmin=0.0, vmax=1.0, cmap="viridis")
-    axes[0].set_title(f"Baseline fine-tuned ({len(baseline_indices)} layers)")
+    axes[0].set_title(f"Reference/source ({len(baseline_indices)} layers)")
     axes[0].set_xticks(range(len(baseline_indices)), baseline_indices, rotation=90)
     axes[0].set_yticks(range(len(baseline_indices)), baseline_indices)
 
@@ -117,40 +119,85 @@ def main(args: Args) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    baseline_metadata = json.loads(
-        (baseline_dir / "metadata.json").read_text(encoding="utf-8")
-    )
-    optimized_metadata = json.loads(
-        (optimized_dir / "metadata.json").read_text(encoding="utf-8")
-    )
+    baseline_metadata = json.loads((baseline_dir / "metadata.json").read_text(encoding="utf-8"))
+    optimized_metadata = json.loads((optimized_dir / "metadata.json").read_text(encoding="utf-8"))
     baseline_archive = np.load(baseline_dir / "activations.npz")
     optimized_archive = np.load(optimized_dir / "activations.npz")
 
     if optimized_metadata.get("cka_pruning_manifest") is None:
         raise ValueError("Optimized checkpoint has no CKA pruning manifest")
-    if baseline_metadata.get("sampled_steps") != optimized_metadata.get("sampled_steps"):
+    sampled_steps = baseline_metadata.get("sampled_steps")
+    if sampled_steps != optimized_metadata.get("sampled_steps"):
         raise ValueError("Heatmaps require identical calibration observations and seeds")
+    if not isinstance(sampled_steps, list) or len(sampled_steps) < 3:
+        raise ValueError(
+            "Recovered CKA comparison needs at least three identical observations; "
+            "two-sample centered CKA is degenerate"
+        )
+    if baseline_metadata.get("dataset_fingerprint") != optimized_metadata.get(
+        "dataset_fingerprint"
+    ):
+        raise ValueError("Baseline/optimized CKA captures used different dataset contents")
 
-    common_modules = sorted(
-        _module_names(baseline_archive) & _module_names(optimized_archive)
+    protocol_keys = (
+        "embodiment_tag",
+        "trajectory_ids",
+        "samples_per_trajectory",
+        "sample_stride",
+        "denoising_steps",
+        "seed",
+        "modules",
     )
+    baseline_capture_args = baseline_metadata.get("args", {})
+    optimized_capture_args = optimized_metadata.get("args", {})
+    protocol_mismatches = {
+        key: (baseline_capture_args.get(key), optimized_capture_args.get(key))
+        for key in protocol_keys
+        if baseline_capture_args.get(key) != optimized_capture_args.get(key)
+    }
+    if protocol_mismatches:
+        raise ValueError(f"Baseline/optimized CKA capture protocol differs: {protocol_mismatches}")
+    if baseline_metadata.get("sample_aggregation") != optimized_metadata.get("sample_aggregation"):
+        raise ValueError(
+            "Baseline/optimized activation aggregation differs: "
+            f"{baseline_metadata.get('sample_aggregation')!r} versus "
+            f"{optimized_metadata.get('sample_aggregation')!r}"
+        )
+
+    baseline_modules = _module_names(baseline_archive)
+    optimized_modules = _module_names(optimized_archive)
+    if baseline_modules != optimized_modules:
+        raise ValueError(
+            "Baseline/optimized archives contain different CKA modules: "
+            f"baseline={sorted(baseline_modules)}, optimized={sorted(optimized_modules)}"
+        )
+    common_modules = sorted(baseline_modules)
     if not common_modules:
         raise ValueError("Baseline and optimized archives have no common CKA modules")
 
-    report = {"args": asdict(args), "modules": {}}
+    report = {
+        "args": asdict(args),
+        "reference_model_path": baseline_metadata.get("args", {}).get("model_path"),
+        "optimized_model_path": optimized_metadata.get("args", {}).get("model_path"),
+        "modules": {},
+    }
     for module_name in common_modules:
         baseline_layers = _load_layers(baseline_archive, module_name)
         optimized_layers = _load_layers(optimized_archive, module_name)
-        if baseline_layers[0].shape[0] != optimized_layers[0].shape[0]:
-            raise ValueError(f"{module_name}: baseline/optimized sample counts differ")
+        baseline_counts = {layer.shape[0] for layer in baseline_layers}
+        optimized_counts = {layer.shape[0] for layer in optimized_layers}
+        expected_samples = len(baseline_metadata["sampled_steps"])
+        if baseline_counts != {expected_samples} or optimized_counts != {expected_samples}:
+            raise ValueError(
+                f"{module_name}: expected one activation row for each of "
+                f"{expected_samples} observations, got baseline={sorted(baseline_counts)}, "
+                f"optimized={sorted(optimized_counts)}. Recapture both sides with the same "
+                "capture_activations.py version and denoising configuration."
+            )
         baseline_matrix = _matrix(baseline_layers)
         optimized_matrix = _matrix(optimized_layers)
-        baseline_indices = _indices(
-            baseline_metadata, module_name, len(baseline_layers)
-        )
-        optimized_indices = _indices(
-            optimized_metadata, module_name, len(optimized_layers)
-        )
+        baseline_indices = _indices(baseline_metadata, module_name, len(baseline_layers))
+        optimized_indices = _indices(optimized_metadata, module_name, len(optimized_layers))
         baseline_retained = _draw(
             module_name,
             baseline_matrix,
@@ -164,9 +211,7 @@ def main(args: Args) -> None:
             "baseline_original_indices": baseline_indices,
             "optimized_original_indices": optimized_indices,
             "baseline_off_diagonal_mean": _off_diagonal_mean(baseline_matrix),
-            "baseline_retained_off_diagonal_mean": _off_diagonal_mean(
-                baseline_retained
-            ),
+            "baseline_retained_off_diagonal_mean": _off_diagonal_mean(baseline_retained),
             "optimized_off_diagonal_mean": _off_diagonal_mean(optimized_matrix),
             "baseline_retained_adjacent_mean": _adjacent_mean(baseline_retained),
             "optimized_adjacent_mean": _adjacent_mean(optimized_matrix),

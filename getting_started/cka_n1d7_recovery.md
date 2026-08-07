@@ -10,11 +10,15 @@ before/after CKA heatmaps and an automatically labeled conclusion.
 
 ## What is pruned in N1.7
 
-| Manifest target | N1.7 implementation | Default depth |
+| Manifest target | N1.7 implementation | Official N1.7 LIBERO checkpoint depth |
 |---|---|---:|
-| `backbone_language` | Cosmos-Reason2/Qwen3-VL language layers used by GR00T | 12 |
-| `action_dit` | `AlternateVLDiT.transformer_blocks` | 16 |
+| `backbone_language` | Cosmos-Reason2/Qwen3-VL language layers used by GR00T | 16 |
+| `action_dit` | `AlternateVLDiT.transformer_blocks` | 32 |
 | `vl_self_attention` | action-head VL self-attention adapter | checkpoint-defined (commonly 4) |
+
+The source-code construction defaults are smaller (12/16), so never hardcode
+these values in a notebook. Capture and manifest validation use the depth of
+the checkpoint actually loaded.
 
 Qwen3-VL vision blocks are intentionally excluded. Unlike the N1.5 Eagle
 backbone, N1.7 vision features participate in Qwen3-VL deep-stack taps and a
@@ -112,6 +116,12 @@ research result.
 
 Use at least 32 observations in total. More varied calibration episodes are
 preferable to many neighboring frames from one episode.
+
+Activation archives use schema version 2. Every layer stores exactly one row
+per selected observation; repeated Action-DiT calls across denoising steps are
+aggregated within that observation. Delete and recapture older archives: the
+analyzer intentionally rejects legacy archives whose sample axes can be
+misaligned across language, Action-DiT and VL-attention modules.
 
 ### 4. Calculate CKA and generate the manifest
 
@@ -214,6 +224,35 @@ uv run python gr00t/experiment/launch_finetune.py \
 First establish a learning curve at 500/2k/5k/10k steps. A paper reproduction
 may require substantially more training, as CLP N1.5 reports use task-dependent
 runs up to 100k-200k steps.
+
+For memory-bounded single-GPU recovery, the branch also supports opt-in
+Action-DiT LoRA checkpoints. Keep the same values for baseline and CKA. When a
+run is split at 1000/2000/3000, set `--lr-scheduler-total-steps 3000` in every
+stage so the learning-rate schedule has one fixed final horizon. Enable compact
+numbered checkpoints with `GR00T_ACTION_DIT_LORA_ADAPTER_CHECKPOINTS=1`; only
+the final stage should set `GR00T_ACTION_DIT_LORA_EXPORT_FINAL=1` to merge LoRA
+and write a standalone model. Resume validation rejects a different pruning
+manifest, adapter layout or scheduler horizon.
+
+Add `--exact-data-resume` when a staged run must reproduce the uninterrupted
+iterable sample order. It replays/skips prior video samples and can therefore
+make stage startup much slower. Without it, resume uses a deterministic
+stage-specific seed; use the same stage boundaries for every compared model
+and do not describe that mode as bitwise-equivalent to one uninterrupted run.
+
+```bash
+export GR00T_ACTION_DIT_LORA_RANK=16
+export GR00T_ACTION_DIT_LORA_ALPHA=32
+export GR00T_ACTION_DIT_LORA_DROPOUT=0.05
+export GR00T_ACTION_DIT_LORA_ADAPTER_CHECKPOINTS=1
+# Set only for the last stage:
+export GR00T_ACTION_DIT_LORA_EXPORT_FINAL=1
+```
+
+The T4 mode no longer changes the optimizer implicitly. Pass the same
+`--optim` value to all compared runs. For an OOM-only smoke fallback, set
+`GR00T_LOW_VRAM_T4_USE_ADAFACTOR=1` and label the resulting run separately
+from AdamW results.
 
 ### 4. Evaluate both fine-tuned checkpoints
 

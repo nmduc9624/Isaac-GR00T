@@ -94,3 +94,19 @@ def test_action_selection_preserves_all_attention_categories():
     assert any(index % 4 == 0 for index in keep)
     assert any(index % 4 == 2 for index in keep)
     assert any(index % 2 == 1 for index in keep)
+    assert keep[0] == 0
+    assert keep[-1] == 15
+
+
+def test_non_action_selection_preserves_boundaries_when_budget_allows():
+    scores = [0.99, 0.98, 0.97, 0.96, 0.95]
+    keep = select_keep_indices(scores, 3, module_name="backbone_language")
+    assert keep[0] == 0
+    assert keep[-1] == 5
+
+
+def test_linear_cka_is_numerically_bounded():
+    rng = np.random.default_rng(8)
+    left = rng.normal(size=(32, 17))
+    right = left + rng.normal(scale=1e-12, size=left.shape)
+    assert 0.0 <= linear_cka(left, right) <= 1.0
