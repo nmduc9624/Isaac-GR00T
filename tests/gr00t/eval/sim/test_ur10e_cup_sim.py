@@ -28,6 +28,9 @@ def test_proxy_contract_is_20_hz_and_explicitly_uncalibrated():
     config = UR10eCupSimConfig()
     config.validate()
     assert config.physics_substeps == 25
+    assert config.reset_settle_control_steps == 20
+    assert config.dataset_support_tolerance_rad == pytest.approx(0.02)
+    assert config.hardware_joint_limit_tolerance_rad == pytest.approx(0.01)
     assert config.simulation_fidelity == "proxy"
     assert config.calibration_verified is False
 
@@ -51,7 +54,7 @@ def test_load_config_round_trip(tmp_path):
     assert config.stable_success_steps == 7
 
 
-def test_optional_mujoco_smoke():
+def test_optional_mujoco_safe_hold_and_safety_taxonomy():
     mujoco = pytest.importorskip("mujoco")
     del mujoco
     from gr00t.eval.sim.UR10eCup.ur10e_cup_env import UR10eCupEnv
@@ -66,15 +69,41 @@ def test_optional_mujoco_smoke():
         assert observation["annotation.human.task_description"] == "pick up the cup"
         assert info["simulation_fidelity"] == "proxy"
         assert info["calibration_verified"] is False
+        assert info["table_support"] is True
+        assert info["hardware_safety_violation"] is False
+        assert info["safety_violation"] is False
+        hold_arm = observation["state.arm_joints"].copy()
         action = {
-            "action.arm_joints": observation["state.arm_joints"],
+            "action.arm_joints": hold_arm,
             "action.gripper": np.array([1.0], dtype=np.float32),
         }
-        next_observation, reward, terminated, truncated, next_info = env.step(action)
+        for _ in range(400):
+            next_observation, reward, terminated, truncated, next_info = env.step(action)
+            assert terminated is False, next_info
+            assert truncated is False
+            assert next_info["hardware_safety_violation"] is False, next_info
         assert env.observation_space.contains(next_observation)
         assert reward in {0.0, 1.0}
-        assert isinstance(terminated, bool)
-        assert truncated is False
         assert isinstance(next_info["success"], bool)
+        assert next_info["step_count"] == 400
+        assert len(next_info["arm_qpos_rad"]) == 6
+        assert len(next_info["arm_target_rad"]) == 6
+
+        # The observed demonstration envelope is deliberately narrower than
+        # the UR10e mechanical range.  Leaving it is diagnostic only.
+        env.data.qpos[env._joint_qpos_addresses[0]] = DATASET_ARM_LOW[0] - 0.03
+        env._mujoco.mj_forward(env.model, env.data)
+        support_info = env._task_metrics()
+        assert support_info["dataset_support_violation"] is True
+        assert support_info["dataset_support_violation_joints"] == ["shoulder_pan"]
+        assert support_info["hardware_safety_violation"] is False
+
+        # A true MJCF mechanical-limit breach is terminating safety state.
+        env.data.qpos[env._joint_qpos_addresses[0]] = env._hardware_arm_high[0] + 0.02
+        env._mujoco.mj_forward(env.model, env.data)
+        hardware_info = env._task_metrics()
+        assert hardware_info["hardware_safety_violation"] is True
+        assert hardware_info["hardware_safety_violation_joints"] == ["shoulder_pan"]
+        assert hardware_info["safety_violation"] is True
     finally:
         env.close()

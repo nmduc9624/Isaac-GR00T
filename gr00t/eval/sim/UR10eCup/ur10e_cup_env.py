@@ -26,6 +26,7 @@ from .sim_config import (
     DATASET_ARM_HIGH,
     DATASET_ARM_LOW,
     DATASET_ARM_RESET,
+    DATASET_JOINT_NAMES,
     MUJOCO_JOINT_NAMES,
     WRIST_2_INDEX,
     UR10eCupSimConfig,
@@ -46,6 +47,8 @@ _PROXY_MJCF = """
   <default>
     <joint damping="4" armature="0.05"/>
     <geom condim="4" friction="1.0 0.01 0.001"/>
+    <!-- Gravity compensation prevents static pose drift; these moderate
+         gains remain stable at the 2-ms RK4 physics timestep. -->
     <position kp="180" kv="28"/>
   </default>
   <asset>
@@ -62,32 +65,32 @@ _PROXY_MJCF = """
     <body name="base" pos="0 0 0.08">
       <geom type="cylinder" size="0.10 0.08" contype="0" conaffinity="0"
             rgba="0.15 0.45 0.75 1"/>
-      <body name="shoulder" pos="0 0 0.1273">
+      <body name="shoulder" pos="0 0 0.1273" gravcomp="1">
         <joint name="shoulder_pan_joint" axis="0 0 1" range="-6.283 6.283"/>
         <geom type="cylinder" size="0.09 0.10" contype="0" conaffinity="0"
               rgba="0.2 0.55 0.85 1"/>
-        <body name="upper_arm" pos="0 0 0.176">
+        <body name="upper_arm" pos="0 0 0.176" gravcomp="1">
           <joint name="shoulder_lift_joint" axis="0 1 0" range="-6.283 6.283"/>
           <geom type="capsule" fromto="0 0 0 0.612 0 0" size="0.065"
                 contype="0" conaffinity="0" rgba="0.55 0.65 0.72 1"/>
-          <body name="forearm" pos="0.612 0 0">
+          <body name="forearm" pos="0.612 0 0" gravcomp="1">
             <joint name="elbow_joint" axis="0 1 0" range="-3.142 3.142"/>
             <geom type="capsule" fromto="0 0 0 0.5723 0 0" size="0.055"
                   contype="0" conaffinity="0" rgba="0.55 0.65 0.72 1"/>
-            <body name="wrist_1_link" pos="0.5723 0 0">
+            <body name="wrist_1_link" pos="0.5723 0 0" gravcomp="1">
               <joint name="wrist_1_joint" axis="0 1 0" range="-6.283 6.283"/>
               <geom type="cylinder" size="0.06 0.08" contype="0" conaffinity="0"
                     rgba="0.2 0.55 0.85 1"/>
-              <body name="wrist_2_link" pos="0 0 0.1639">
+              <body name="wrist_2_link" pos="0 0 0.1639" gravcomp="1">
                 <joint name="wrist_2_joint" axis="0 0 1" range="-6.283 6.283"/>
                 <geom type="cylinder" size="0.055 0.07" contype="0" conaffinity="0"
                       rgba="0.2 0.55 0.85 1"/>
-                <body name="wrist_3_link" pos="0 0 0.1157">
+                <body name="wrist_3_link" pos="0 0 0.1157" gravcomp="1">
                   <joint name="wrist_3_joint" axis="0 1 0" range="-6.283 6.283"/>
                   <geom type="cylinder" size="0.05 0.07" contype="0" conaffinity="0"
                         rgba="0.2 0.55 0.85 1"/>
                   <camera name="wrist" pos="0.08 0 0" quat="0.5 0.5 -0.5 -0.5"/>
-                  <body name="tool" pos="0 0 0.11">
+                  <body name="tool" pos="0 0 0.11" gravcomp="1">
                     <geom name="palm" type="box" size="0.035 0.055 0.025"
                           contype="0" conaffinity="0" rgba="0.12 0.12 0.12 1"/>
                     <body name="left_finger" pos="0 0.012 -0.065">
@@ -159,12 +162,15 @@ class UR10eCupEnv(gym.Env):
             height=self.config.render_height,
             width=self.config.render_width,
         )
-        self._joint_qpos_addresses = np.array(
-            [
-                self.model.jnt_qposadr[self._name_id(mujoco.mjtObj.mjOBJ_JOINT, name)]
-                for name in MUJOCO_JOINT_NAMES
-            ]
+        self._joint_ids = np.array(
+            [self._name_id(mujoco.mjtObj.mjOBJ_JOINT, name) for name in MUJOCO_JOINT_NAMES]
         )
+        self._joint_qpos_addresses = self.model.jnt_qposadr[self._joint_ids].astype(int)
+        self._joint_dof_addresses = self.model.jnt_dofadr[self._joint_ids].astype(int)
+        joint_limited = self.model.jnt_limited[self._joint_ids].astype(bool)
+        joint_ranges = self.model.jnt_range[self._joint_ids]
+        self._hardware_arm_low = np.where(joint_limited, joint_ranges[:, 0], -np.inf)
+        self._hardware_arm_high = np.where(joint_limited, joint_ranges[:, 1], np.inf)
         self._cup_joint_id = self._name_id(mujoco.mjtObj.mjOBJ_JOINT, "cup_freejoint")
         self._cup_qpos_address = int(self.model.jnt_qposadr[self._cup_joint_id])
         self._cup_body_id = self._name_id(mujoco.mjtObj.mjOBJ_BODY, "cup")
@@ -175,6 +181,7 @@ class UR10eCupEnv(gym.Env):
         self._initial_cup_z = self.config.cup_reset_z
         self._success_streak = 0
         self._step_count = 0
+        self._last_arm_target = DATASET_ARM_RESET.copy()
 
         self.observation_space = spaces.Dict(
             {
@@ -260,11 +267,33 @@ class UR10eCupEnv(gym.Env):
         stable_now = left_contact and right_contact and lifted and not table_support
         self._success_streak = self._success_streak + 1 if stable_now else 0
         success = self._success_streak >= self.config.stable_success_steps
-        arm = self.data.qpos[self._joint_qpos_addresses]
-        safety_violation = bool(
+        arm = self.data.qpos[self._joint_qpos_addresses].copy()
+        arm_velocity = self.data.qvel[self._joint_dof_addresses].copy()
+        finite_mask = np.isfinite(arm) & np.isfinite(arm_velocity)
+        dataset_tolerance = self.config.dataset_support_tolerance_rad
+        dataset_violation_mask = finite_mask & (
+            (arm < DATASET_ARM_LOW - dataset_tolerance)
+            | (arm > DATASET_ARM_HIGH + dataset_tolerance)
+        )
+        hardware_tolerance = self.config.hardware_joint_limit_tolerance_rad
+        hardware_violation_mask = (~finite_mask) | (
+            arm < self._hardware_arm_low - hardware_tolerance
+        ) | (arm > self._hardware_arm_high + hardware_tolerance)
+        dataset_violation_joints = [
+            name
+            for name, violated in zip(DATASET_JOINT_NAMES, dataset_violation_mask, strict=True)
+            if violated
+        ]
+        hardware_violation_joints = [
+            name
+            for name, violated in zip(DATASET_JOINT_NAMES, hardware_violation_mask, strict=True)
+            if violated
+        ]
+        dataset_support_violation = bool(np.any(dataset_violation_mask))
+        hardware_safety_violation = bool(
             not np.isfinite(self.data.qpos).all()
-            or np.any(arm < DATASET_ARM_LOW - 0.02)
-            or np.any(arm > DATASET_ARM_HIGH + 0.02)
+            or not np.isfinite(self.data.qvel).all()
+            or np.any(hardware_violation_mask)
         )
         return {
             "success": bool(success),
@@ -274,7 +303,19 @@ class UR10eCupEnv(gym.Env):
             "cup_height_m": cup_height,
             "lifted": bool(lifted),
             "stable_success_steps": int(self._success_streak),
-            "safety_violation": safety_violation,
+            # Leaving the demonstration envelope is an out-of-distribution
+            # warning, not a hardware fault.  Only non-finite state or a true
+            # MJCF joint-limit breach may terminate an episode.
+            "dataset_support_violation": dataset_support_violation,
+            "dataset_support_violation_joints": dataset_violation_joints,
+            "hardware_safety_violation": hardware_safety_violation,
+            "hardware_safety_violation_joints": hardware_violation_joints,
+            # Backwards-compatible alias; it now means hardware safety only.
+            "safety_violation": hardware_safety_violation,
+            "arm_qpos_rad": arm.tolist(),
+            "arm_qvel_rad_s": arm_velocity.tolist(),
+            "arm_target_rad": self._last_arm_target.tolist(),
+            "step_count": int(self._step_count),
             "simulation_fidelity": self.config.simulation_fidelity,
             "calibration_verified": self.config.calibration_verified,
         }
@@ -288,6 +329,7 @@ class UR10eCupEnv(gym.Env):
         arm = np.clip(DATASET_ARM_RESET + arm_noise, DATASET_ARM_LOW, DATASET_ARM_HIGH)
         self.data.qpos[self._joint_qpos_addresses] = arm
         self.data.ctrl[:6] = arm
+        self._last_arm_target = arm.copy()
         self.data.ctrl[6:8] = 0.035  # Dataset gripper command 1 means open.
         cup_xy = np.asarray(self.config.cup_reset_xy) + self.np_random.uniform(
             -self.config.cup_reset_xy_noise,
@@ -298,10 +340,21 @@ class UR10eCupEnv(gym.Env):
         cup_pose[:3] = (cup_xy[0], cup_xy[1], self.config.cup_reset_z)
         cup_pose[3:] = (1.0, 0.0, 0.0, 0.0)
         self._mujoco.mj_forward(self.model, self.data)
+        # Let the cup establish table contact and let the gravity-compensated
+        # arm servo converge before exposing the first observation.  Settling
+        # is initialization and therefore does not consume episode steps.
+        for _ in range(self.config.reset_settle_control_steps * self.config.physics_substeps):
+            self._mujoco.mj_step(self.model, self.data)
         self._initial_cup_z = float(self.data.xpos[self._cup_body_id, 2])
         self._success_streak = 0
         self._step_count = 0
         info = self._task_metrics()
+        if info["hardware_safety_violation"]:
+            raise RuntimeError(
+                "UR10e proxy violated a hardware joint limit while settling: "
+                f"{info['hardware_safety_violation_joints']}; "
+                f"qpos={info['arm_qpos_rad']}; target={info['arm_target_rad']}"
+            )
         return self._observation(), info
 
     def step(self, action: dict[str, np.ndarray]):
@@ -313,13 +366,14 @@ class UR10eCupEnv(gym.Env):
         # wrist_2 is nearly constant in all demonstrations (std ~= 8e-4 rad).
         # Preserve tensor shape but do not command extrapolated motion.
         arm_target[WRIST_2_INDEX] = self.data.qpos[self._joint_qpos_addresses[WRIST_2_INDEX]]
+        self._last_arm_target = arm_target.copy()
         self.data.ctrl[:6] = arm_target
         self.data.ctrl[6:8] = 0.035 * np.clip(gripper_target, 0.0, 1.0)
         for _ in range(self.config.physics_substeps):
             self._mujoco.mj_step(self.model, self.data)
         self._step_count += 1
         info = self._task_metrics()
-        terminated = bool(info["success"] or info["safety_violation"])
+        terminated = bool(info["success"] or info["hardware_safety_violation"])
         reward = float(info["success"])
         return self._observation(), reward, terminated, False, info
 

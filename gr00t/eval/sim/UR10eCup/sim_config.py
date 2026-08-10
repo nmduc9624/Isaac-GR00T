@@ -53,6 +53,9 @@ class UR10eCupSimConfig:
     wrist_2_policy: str = "clamp_current"
     lift_height_m: float = 0.05
     stable_success_steps: int = 5
+    reset_settle_control_steps: int = 20
+    dataset_support_tolerance_rad: float = 0.02
+    hardware_joint_limit_tolerance_rad: float = 0.01
     cup_reset_xy: tuple[float, float] = (-0.42, -0.30)
     cup_reset_xy_noise: float = 0.015
     cup_reset_z: float = 0.105
@@ -95,6 +98,12 @@ class UR10eCupSimConfig:
             raise ValueError("render dimensions must be positive")
         if self.stable_success_steps < 1:
             raise ValueError("stable_success_steps must be >= 1")
+        if self.reset_settle_control_steps < 1:
+            raise ValueError("reset_settle_control_steps must be >= 1")
+        if self.dataset_support_tolerance_rad < 0:
+            raise ValueError("dataset_support_tolerance_rad must be >= 0")
+        if self.hardware_joint_limit_tolerance_rad < 0:
+            raise ValueError("hardware_joint_limit_tolerance_rad must be >= 0")
         if self.physics_timestep <= 0:
             raise ValueError("physics_timestep must be positive")
         _ = self.physics_substeps
