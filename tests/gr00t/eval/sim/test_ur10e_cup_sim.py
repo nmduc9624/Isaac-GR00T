@@ -8,6 +8,7 @@ import json
 from gr00t.eval.sim.UR10eCup.sim_config import (
     DATASET_ARM_HIGH,
     DATASET_ARM_LOW,
+    DATASET_ARM_RESET,
     DATASET_JOINT_NAMES,
     MUJOCO_JOINT_NAMES,
     WRIST_2_INDEX,
@@ -28,6 +29,7 @@ def test_proxy_contract_is_20_hz_and_explicitly_uncalibrated():
     config = UR10eCupSimConfig()
     config.validate()
     assert config.physics_substeps == 25
+    assert config.approach_distance_m == pytest.approx(0.12)
     assert config.reset_settle_control_steps == 20
     assert config.dataset_support_tolerance_rad == pytest.approx(0.02)
     assert config.hardware_joint_limit_tolerance_rad == pytest.approx(0.01)
@@ -64,6 +66,8 @@ def test_optional_mujoco_safe_hold_and_safety_taxonomy():
         observation, info = env.reset(seed=7)
         assert observation["video.side"].shape == (480, 640, 3)
         assert observation["video.wrist"].shape == (480, 640, 3)
+        assert float(observation["video.wrist"].mean()) > 1.0
+        assert float(observation["video.wrist"].std()) > 1.0
         assert observation["state.arm_joints"].shape == (6,)
         assert observation["state.gripper"].shape == (1,)
         assert observation["annotation.human.task_description"] == "pick up the cup"
@@ -88,6 +92,20 @@ def test_optional_mujoco_safe_hold_and_safety_taxonomy():
         assert next_info["step_count"] == 400
         assert len(next_info["arm_qpos_rad"]) == 6
         assert len(next_info["arm_target_rad"]) == 6
+        assert len(next_info["arm_target_delta_rad"]) == 6
+        assert len(next_info["tool_position_m"]) == 3
+        assert len(next_info["cup_position_m"]) == 3
+        assert np.isfinite(next_info["tool_cup_distance_m"])
+        assert next_info["max_cup_height_m"] >= next_info["cup_height_m"] - 1e-9
+        assert next_info["gripper_target"] == pytest.approx(1.0)
+
+        replay_arm = DATASET_ARM_RESET + np.array([0.001, 0, 0, 0, 0, 0])
+        replay_observation, replay_info = env.reset(
+            seed=8,
+            options={"arm_qpos": replay_arm, "gripper_open_fraction": 0.0},
+        )
+        assert replay_observation["state.arm_joints"] == pytest.approx(replay_arm, abs=0.01)
+        assert replay_info["gripper_target"] == pytest.approx(0.0)
 
         # The observed demonstration envelope is deliberately narrower than
         # the UR10e mechanical range.  Leaving it is diagnostic only.

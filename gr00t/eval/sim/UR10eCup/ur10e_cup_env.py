@@ -89,8 +89,11 @@ _PROXY_MJCF = """
                   <joint name="wrist_3_joint" axis="0 1 0" range="-6.283 6.283"/>
                   <geom type="cylinder" size="0.05 0.07" contype="0" conaffinity="0"
                         rgba="0.2 0.55 0.85 1"/>
-                  <camera name="wrist" pos="0.08 0 0" quat="0.5 0.5 -0.5 -0.5"/>
                   <body name="tool" pos="0 0 0.11" gravcomp="1">
+                    <!-- MuJoCo cameras look along local -Z.  Mounting the
+                         wrist camera on the tool with +Y as image-up keeps
+                         the fingers and workspace in view. -->
+                    <camera name="wrist" pos="0.055 0 0.015" xyaxes="1 0 0 0 1 0"/>
                     <geom name="palm" type="box" size="0.035 0.055 0.025"
                           contype="0" conaffinity="0" rgba="0.12 0.12 0.12 1"/>
                     <body name="left_finger" pos="0 0.012 -0.065">
@@ -174,6 +177,7 @@ class UR10eCupEnv(gym.Env):
         self._cup_joint_id = self._name_id(mujoco.mjtObj.mjOBJ_JOINT, "cup_freejoint")
         self._cup_qpos_address = int(self.model.jnt_qposadr[self._cup_joint_id])
         self._cup_body_id = self._name_id(mujoco.mjtObj.mjOBJ_BODY, "cup")
+        self._tool_body_id = self._name_id(mujoco.mjtObj.mjOBJ_BODY, "tool")
         self._geom_ids = {
             name: self._name_id(mujoco.mjtObj.mjOBJ_GEOM, name)
             for name in ("left_finger_pad", "right_finger_pad", "cup_geom", "table", "floor")
@@ -182,6 +186,8 @@ class UR10eCupEnv(gym.Env):
         self._success_streak = 0
         self._step_count = 0
         self._last_arm_target = DATASET_ARM_RESET.copy()
+        self._last_gripper_target = 1.0
+        self._episode_max_cup_height = self.config.cup_reset_z
 
         self.observation_space = spaces.Dict(
             {
@@ -223,8 +229,9 @@ class UR10eCupEnv(gym.Env):
     def _name_id(self, object_type: Any, name: str) -> int:
         object_id = self._mujoco.mj_name2id(self.model, object_type, name)
         if object_id < 0:
+            object_name = object_type.name.removeprefix("mjOBJ_").lower()
             raise ValueError(
-                f"MJCF is missing required {object_type.name.removeprefix('mjOBJ_').lower()} {name!r}"
+                f"MJCF is missing required {object_name} {name!r}"
             )
         return int(object_id)
 
@@ -263,6 +270,10 @@ class UR10eCupEnv(gym.Env):
             frozenset((cup, self._geom_ids[name])) in contacts for name in ("table", "floor")
         )
         cup_height = float(self.data.xpos[self._cup_body_id, 2])
+        self._episode_max_cup_height = max(self._episode_max_cup_height, cup_height)
+        tool_position = self.data.xpos[self._tool_body_id].copy()
+        cup_position = self.data.xpos[self._cup_body_id].copy()
+        tool_cup_distance = float(np.linalg.norm(tool_position - cup_position))
         lifted = cup_height >= self._initial_cup_z + self.config.lift_height_m
         stable_now = left_contact and right_contact and lifted and not table_support
         self._success_streak = self._success_streak + 1 if stable_now else 0
@@ -301,6 +312,11 @@ class UR10eCupEnv(gym.Env):
             "right_finger_contact": bool(right_contact),
             "table_support": bool(table_support),
             "cup_height_m": cup_height,
+            "max_cup_height_m": float(self._episode_max_cup_height),
+            "tool_position_m": tool_position.tolist(),
+            "cup_position_m": cup_position.tolist(),
+            "tool_cup_distance_m": tool_cup_distance,
+            "approached_cup": tool_cup_distance <= self.config.approach_distance_m,
             "lifted": bool(lifted),
             "stable_success_steps": int(self._success_streak),
             # Leaving the demonstration envelope is an out-of-distribution
@@ -315,6 +331,9 @@ class UR10eCupEnv(gym.Env):
             "arm_qpos_rad": arm.tolist(),
             "arm_qvel_rad_s": arm_velocity.tolist(),
             "arm_target_rad": self._last_arm_target.tolist(),
+            "arm_target_delta_rad": (self._last_arm_target - arm).tolist(),
+            "gripper_open_fraction": self._gripper_open_fraction(),
+            "gripper_target": float(self._last_gripper_target),
             "step_count": int(self._step_count),
             "simulation_fidelity": self.config.simulation_fidelity,
             "calibration_verified": self.config.calibration_verified,
@@ -322,20 +341,36 @@ class UR10eCupEnv(gym.Env):
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
-        del options
+        options = options or {}
         self._mujoco.mj_resetData(self.model, self.data)
-        arm_noise = self.np_random.uniform(-0.002, 0.002, size=6)
-        arm_noise[WRIST_2_INDEX] = 0.0
-        arm = np.clip(DATASET_ARM_RESET + arm_noise, DATASET_ARM_LOW, DATASET_ARM_HIGH)
+        if "arm_qpos" in options:
+            arm = np.asarray(options["arm_qpos"], dtype=np.float64).reshape(6)
+            if not np.isfinite(arm).all():
+                raise ValueError("reset arm_qpos contains non-finite values")
+            arm = np.clip(arm, DATASET_ARM_LOW, DATASET_ARM_HIGH)
+        else:
+            arm_noise = self.np_random.uniform(-0.002, 0.002, size=6)
+            arm_noise[WRIST_2_INDEX] = 0.0
+            arm = np.clip(DATASET_ARM_RESET + arm_noise, DATASET_ARM_LOW, DATASET_ARM_HIGH)
         self.data.qpos[self._joint_qpos_addresses] = arm
         self.data.ctrl[:6] = arm
         self._last_arm_target = arm.copy()
-        self.data.ctrl[6:8] = 0.035  # Dataset gripper command 1 means open.
-        cup_xy = np.asarray(self.config.cup_reset_xy) + self.np_random.uniform(
-            -self.config.cup_reset_xy_noise,
-            self.config.cup_reset_xy_noise,
-            size=2,
-        )
+        gripper_open_fraction = float(options.get("gripper_open_fraction", 1.0))
+        if not np.isfinite(gripper_open_fraction):
+            raise ValueError("reset gripper_open_fraction must be finite")
+        gripper_open_fraction = float(np.clip(gripper_open_fraction, 0.0, 1.0))
+        self._last_gripper_target = gripper_open_fraction
+        self.data.ctrl[6:8] = 0.035 * gripper_open_fraction
+        if "cup_xy" in options:
+            cup_xy = np.asarray(options["cup_xy"], dtype=np.float64).reshape(2)
+            if not np.isfinite(cup_xy).all():
+                raise ValueError("reset cup_xy contains non-finite values")
+        else:
+            cup_xy = np.asarray(self.config.cup_reset_xy) + self.np_random.uniform(
+                -self.config.cup_reset_xy_noise,
+                self.config.cup_reset_xy_noise,
+                size=2,
+            )
         cup_pose = self.data.qpos[self._cup_qpos_address : self._cup_qpos_address + 7]
         cup_pose[:3] = (cup_xy[0], cup_xy[1], self.config.cup_reset_z)
         cup_pose[3:] = (1.0, 0.0, 0.0, 0.0)
@@ -346,6 +381,7 @@ class UR10eCupEnv(gym.Env):
         for _ in range(self.config.reset_settle_control_steps * self.config.physics_substeps):
             self._mujoco.mj_step(self.model, self.data)
         self._initial_cup_z = float(self.data.xpos[self._cup_body_id, 2])
+        self._episode_max_cup_height = self._initial_cup_z
         self._success_streak = 0
         self._step_count = 0
         info = self._task_metrics()
@@ -367,8 +403,9 @@ class UR10eCupEnv(gym.Env):
         # Preserve tensor shape but do not command extrapolated motion.
         arm_target[WRIST_2_INDEX] = self.data.qpos[self._joint_qpos_addresses[WRIST_2_INDEX]]
         self._last_arm_target = arm_target.copy()
+        self._last_gripper_target = float(np.clip(gripper_target, 0.0, 1.0))
         self.data.ctrl[:6] = arm_target
-        self.data.ctrl[6:8] = 0.035 * np.clip(gripper_target, 0.0, 1.0)
+        self.data.ctrl[6:8] = 0.035 * self._last_gripper_target
         for _ in range(self.config.physics_substeps):
             self._mujoco.mj_step(self.model, self.data)
         self._step_count += 1

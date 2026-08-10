@@ -51,6 +51,7 @@ class UR10eCupSimConfig:
     render_height: int = 480
     render_width: int = 640
     wrist_2_policy: str = "clamp_current"
+    approach_distance_m: float = 0.12
     lift_height_m: float = 0.05
     stable_success_steps: int = 5
     reset_settle_control_steps: int = 20
@@ -98,6 +99,8 @@ class UR10eCupSimConfig:
             raise ValueError("render dimensions must be positive")
         if self.stable_success_steps < 1:
             raise ValueError("stable_success_steps must be >= 1")
+        if self.approach_distance_m <= 0:
+            raise ValueError("approach_distance_m must be positive")
         if self.reset_settle_control_steps < 1:
             raise ValueError("reset_settle_control_steps must be >= 1")
         if self.dataset_support_tolerance_rad < 0:

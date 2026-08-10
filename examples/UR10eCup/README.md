@@ -109,6 +109,31 @@ calibration. Therefore proxy success rate is useful for software regression
 and matched model comparison, but **must not be reported as real-robot success
 rate**.
 
+Before any policy rollout, replay a held-out recorded demonstration through
+the simulator. Episode 73 is the first episode in the recommended test split:
+
+```bash
+MUJOCO_GL=egl uv run python -m \
+  gr00t.eval.sim.UR10eCup.replay_dataset_trajectory \
+  --dataset-path examples/UR10eCup/ur10e_cup_lerobot/khanhnd61/ur10e-cup \
+  --episode-index 73 \
+  --output-dir /tmp/ur10e_cup_ground_truth_replay \
+  --save-video
+```
+
+This is a mandatory simulator-calibration gate. It passes only when the
+recorded action trajectory approaches the cup, establishes both finger
+contacts, lifts the cup, and reaches stable success without a hardware safety
+violation. A failed replay means that scene, camera, tool, gripper, or
+controller calibration is still mismatched. In that state, changing pruning
+rate or recovery steps cannot repair the simulator, and policy success rate
+must not be reported. Use `--allow-failure` only while collecting diagnostics.
+
+Every environment step reports arm qpos, commanded target, target error,
+gripper target, finger contacts, tool/cup positions and distance, maximum cup
+height, dataset-support warnings, and hardware-safety violations. These fields
+are intended for diagnosing failed replays and closed-loop rollouts.
+
 To use a calibrated MJCF, point `GR00T_UR10E_SIM_CONFIG` at a JSON file with
 `simulation_fidelity="calibrated"`, `model_xml_path`, and all four verification
 flags (`tool_transform_verified`, `camera_calibration_verified`,
