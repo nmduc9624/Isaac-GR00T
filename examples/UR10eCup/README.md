@@ -73,9 +73,53 @@ uv run python gr00t/eval/open_loop_eval.py \
 
 Report arm and gripper errors separately. The `wrist_2` channel is effectively constant in this dataset and should not dominate aggregate MSE/MAE.
 
-## 5. Real-robot deployment contract
+## 5. MuJoCo proxy simulation
 
-There is no simulator for this cell, so success rate requires real UR10e rollouts. Before sending predictions to the robot controller:
+The repository includes an optional MuJoCo proxy for integration testing and
+paired baseline/pruned rollouts. Install it with:
+
+```bash
+bash gr00t/eval/sim/UR10eCup/setup_ur10e_cup_sim.sh
+```
+
+Run a rollout using the same policy server/client path as other simulators:
+
+```bash
+MUJOCO_GL=egl uv run python gr00t/eval/rollout_policy.py \
+  --env-name ur10e_cup_sim/pick_up_the_cup \
+  --model-path /tmp/ur10e_cup_finetune/checkpoint-10000 \
+  --n-envs 1 \
+  --n-episodes 20 \
+  --n-action-steps 8 \
+  --max-episode-steps 400 \
+  --video-dir /tmp/ur10e_cup_sim_videos
+```
+
+The environment preserves the dataset contract: 20 Hz control, two RGB
+cameras named `video.side` and `video.wrist`, six absolute joint targets plus
+`action.gripper`, and `1=open / 0=closed`. It clamps `wrist_2` to its current
+value because that channel is effectively constant in the demonstrations.
+Success requires both finger contacts, a lifted cup, no table support, and a
+stable hold for several control steps.
+
+The bundled scene is deliberately tagged `simulation_fidelity=proxy` and
+`calibration_verified=false`. The public dataset does not identify the exact
+Robotiq 2F variant or publish TCP, camera, table, cup, or controller
+calibration. Therefore proxy success rate is useful for software regression
+and matched model comparison, but **must not be reported as real-robot success
+rate**.
+
+To use a calibrated MJCF, point `GR00T_UR10E_SIM_CONFIG` at a JSON file with
+`simulation_fidelity="calibrated"`, `model_xml_path`, and all four verification
+flags (`tool_transform_verified`, `camera_calibration_verified`,
+`gripper_calibration_verified`, `scene_calibration_verified`) set to true. The
+MJCF must expose the canonical joint, camera, body, and geom names documented
+in `gr00t/eval/sim/UR10eCup/ur10e_cup_env.py`.
+
+## 6. Real-robot deployment contract
+
+The proxy does not replace hardware evaluation, so real success rate still
+requires UR10e rollouts. Before sending predictions to the robot controller:
 
 1. Interpret model output as six absolute joint targets plus one gripper target.
 2. Clamp `wrist_2` to the observed/current joint value; the dataset contains almost no motion for that channel.

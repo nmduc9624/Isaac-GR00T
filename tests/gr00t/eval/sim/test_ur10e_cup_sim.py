@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""CPU-safe contract tests for the optional UR10e Cup simulator."""
+
+import json
+
+from gr00t.eval.sim.UR10eCup.sim_config import (
+    DATASET_ARM_HIGH,
+    DATASET_ARM_LOW,
+    DATASET_JOINT_NAMES,
+    MUJOCO_JOINT_NAMES,
+    WRIST_2_INDEX,
+    UR10eCupSimConfig,
+    load_sim_config,
+)
+import numpy as np
+import pytest
+
+
+def test_dataset_joint_mapping_is_name_based_and_ordered():
+    assert MUJOCO_JOINT_NAMES == tuple(f"{name}_joint" for name in DATASET_JOINT_NAMES)
+    assert DATASET_JOINT_NAMES[WRIST_2_INDEX] == "wrist_2"
+    assert np.all(DATASET_ARM_LOW < DATASET_ARM_HIGH)
+
+
+def test_proxy_contract_is_20_hz_and_explicitly_uncalibrated():
+    config = UR10eCupSimConfig()
+    config.validate()
+    assert config.physics_substeps == 25
+    assert config.simulation_fidelity == "proxy"
+    assert config.calibration_verified is False
+
+
+def test_calibrated_mode_rejects_missing_verification():
+    with pytest.raises(ValueError, match="verified tool, camera, gripper, and scene"):
+        UR10eCupSimConfig(
+            simulation_fidelity="calibrated",
+            model_xml_path="robot.xml",
+        ).validate()
+
+
+def test_load_config_round_trip(tmp_path):
+    config_path = tmp_path / "sim.json"
+    config_path.write_text(
+        json.dumps({"cup_reset_xy": [-0.4, -0.2], "stable_success_steps": 7}),
+        encoding="utf-8",
+    )
+    config = load_sim_config(config_path)
+    assert config.cup_reset_xy == (-0.4, -0.2)
+    assert config.stable_success_steps == 7
+
+
+def test_optional_mujoco_smoke():
+    mujoco = pytest.importorskip("mujoco")
+    del mujoco
+    from gr00t.eval.sim.UR10eCup.ur10e_cup_env import UR10eCupEnv
+
+    env = UR10eCupEnv()
+    try:
+        observation, info = env.reset(seed=7)
+        assert observation["video.side"].shape == (480, 640, 3)
+        assert observation["video.wrist"].shape == (480, 640, 3)
+        assert observation["state.arm_joints"].shape == (6,)
+        assert observation["state.gripper"].shape == (1,)
+        assert observation["annotation.human.task_description"] == "pick up the cup"
+        assert info["simulation_fidelity"] == "proxy"
+        assert info["calibration_verified"] is False
+        action = {
+            "action.arm_joints": observation["state.arm_joints"],
+            "action.gripper": np.array([1.0], dtype=np.float32),
+        }
+        next_observation, reward, terminated, truncated, next_info = env.step(action)
+        assert env.observation_space.contains(next_observation)
+        assert reward in {0.0, 1.0}
+        assert isinstance(terminated, bool)
+        assert truncated is False
+        assert isinstance(next_info["success"], bool)
+    finally:
+        env.close()
