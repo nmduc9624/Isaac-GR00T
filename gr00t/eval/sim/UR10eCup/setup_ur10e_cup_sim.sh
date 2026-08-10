@@ -8,4 +8,5 @@ set -euo pipefail
 # simulator, and uv pip installs it into the already-created project venv.
 uv pip install "mujoco>=3.1,<4"
 
-python -c "import gymnasium, mujoco; print('UR10e Cup simulator dependencies are ready')"
+uv run --no-sync python -c \
+  "import gymnasium, mujoco; print('UR10e Cup simulator dependencies are ready')"
