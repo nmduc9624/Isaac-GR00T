@@ -116,7 +116,7 @@ the simulator. Episode 73 is the first episode in the recommended test split:
 MUJOCO_GL=egl uv run python -m \
   gr00t.eval.sim.UR10eCup.replay_dataset_trajectory \
   --dataset-path examples/UR10eCup/ur10e_cup_lerobot/khanhnd61/ur10e-cup \
-  --episode-index 73 \
+  --episode-indices 73 74 75 \
   --output-dir /tmp/ur10e_cup_ground_truth_replay \
   --save-video
 ```
@@ -124,22 +124,31 @@ MUJOCO_GL=egl uv run python -m \
 This is a mandatory simulator-calibration gate. It passes only when the
 recorded action trajectory approaches the cup, establishes both finger
 contacts, lifts the cup, and reaches stable success without a hardware safety
-violation. A failed replay means that scene, camera, tool, gripper, or
+violation. Both side and wrist streams must also remain non-blank throughout
+the replay. A failed replay means that scene, camera, tool, gripper, or
 controller calibration is still mismatched. In that state, changing pruning
 rate or recovery steps cannot repair the simulator, and policy success rate
 must not be reported. Use `--allow-failure` only while collecting diagnostics.
 
-Every environment step reports arm qpos, commanded target, target error,
-gripper target, finger contacts, tool/cup positions and distance, maximum cup
-height, dataset-support warnings, and hardware-safety violations. These fields
-are intended for diagnosing failed replays and closed-loop rollouts.
+Each episode directory contains `replay_diagnostics.csv`. Every row aligns
+`action[t]` with the expected `state[t+1]` and records simulator qpos, target,
+error, gripper state, finger contacts, tool/cup positions and distance, cup
+height, dataset-support warnings, and hardware-safety violations. The aggregate
+gate passes only if every requested episode passes. If measured cup poses vary
+by episode, pass a JSON mapping with `--episode-reset-options`; never tune those
+poses from the outcome of the policy being evaluated.
 
-To use a calibrated MJCF, point `GR00T_UR10E_SIM_CONFIG` at a JSON file with
-`simulation_fidelity="calibrated"`, `model_xml_path`, and all four verification
-flags (`tool_transform_verified`, `camera_calibration_verified`,
-`gripper_calibration_verified`, `scene_calibration_verified`) set to true. The
-MJCF must expose the canonical joint, camera, body, and geom names documented
-in `gr00t/eval/sim/UR10eCup/ur10e_cup_env.py`.
+To use a calibrated MJCF, copy
+`gr00t/eval/sim/UR10eCup/calibration.template.json`, replace every placeholder
+with measured values, and point `GR00T_UR10E_SIM_CONFIG` at it. The contract
+requires calibration provenance and SHA-256, the exact gripper endpoints, cup
+pose, explicit names for joints, actuators, cameras, TCP body/site, contacts,
+and support surfaces, plus all four verification flags. The loader verifies
+that actuator-to-joint mappings match dataset order and refuses to label the
+environment calibrated while any required verification is missing. Camera
+extrinsics, robot base/world transform, TCP transform, table/bin geometry, and
+collision meshes must be encoded in the external MJCF; the JSON only maps and
+attests those measured assets.
 
 ## 6. Real-robot deployment contract
 

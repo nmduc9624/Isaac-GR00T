@@ -27,7 +27,6 @@ from .sim_config import (
     DATASET_ARM_LOW,
     DATASET_ARM_RESET,
     DATASET_JOINT_NAMES,
-    MUJOCO_JOINT_NAMES,
     WRIST_2_INDEX,
     UR10eCupSimConfig,
     load_sim_config,
@@ -151,6 +150,7 @@ class UR10eCupEnv(gym.Env):
 
         self._mujoco = mujoco
         self.config: UR10eCupSimConfig = load_sim_config(config_path)
+        self._model_sha256 = self.config.model_sha256
         if self.config.model_xml_path:
             model_path = Path(self.config.model_xml_path).expanduser().resolve()
             if not model_path.is_file():
@@ -166,22 +166,75 @@ class UR10eCupEnv(gym.Env):
             width=self.config.render_width,
         )
         self._joint_ids = np.array(
-            [self._name_id(mujoco.mjtObj.mjOBJ_JOINT, name) for name in MUJOCO_JOINT_NAMES]
+            [self._name_id(mujoco.mjtObj.mjOBJ_JOINT, name) for name in self.config.arm_joint_names]
         )
+        self._arm_actuator_ids = np.array(
+            [
+                self._name_id(mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+                for name in self.config.arm_actuator_names
+            ]
+        )
+        self._gripper_joint_ids = np.array(
+            [
+                self._name_id(mujoco.mjtObj.mjOBJ_JOINT, name)
+                for name in self.config.gripper_joint_names
+            ]
+        )
+        self._gripper_actuator_ids = np.array(
+            [
+                self._name_id(mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+                for name in self.config.gripper_actuator_names
+            ]
+        )
+        arm_transmission_joints = self.model.actuator_trnid[self._arm_actuator_ids, 0]
+        if not np.array_equal(arm_transmission_joints, self._joint_ids):
+            raise ValueError(
+                "arm_actuator_names must map one-to-one to arm_joint_names in dataset order"
+            )
+        gripper_transmission_joints = self.model.actuator_trnid[self._gripper_actuator_ids, 0]
+        gripper_transmission_types = self.model.actuator_trntype[self._gripper_actuator_ids]
+        joint_transmission_mask = gripper_transmission_types == int(mujoco.mjtTrn.mjTRN_JOINT)
+        if not np.isin(
+            gripper_transmission_joints[joint_transmission_mask], self._gripper_joint_ids
+        ).all():
+            raise ValueError("every gripper actuator must drive a configured gripper joint")
         self._joint_qpos_addresses = self.model.jnt_qposadr[self._joint_ids].astype(int)
         self._joint_dof_addresses = self.model.jnt_dofadr[self._joint_ids].astype(int)
+        self._gripper_qpos_addresses = self.model.jnt_qposadr[self._gripper_joint_ids].astype(int)
         joint_limited = self.model.jnt_limited[self._joint_ids].astype(bool)
         joint_ranges = self.model.jnt_range[self._joint_ids]
         self._hardware_arm_low = np.where(joint_limited, joint_ranges[:, 0], -np.inf)
         self._hardware_arm_high = np.where(joint_limited, joint_ranges[:, 1], np.inf)
-        self._cup_joint_id = self._name_id(mujoco.mjtObj.mjOBJ_JOINT, "cup_freejoint")
+        self._cup_joint_id = self._name_id(
+            mujoco.mjtObj.mjOBJ_JOINT, self.config.cup_freejoint_name
+        )
         self._cup_qpos_address = int(self.model.jnt_qposadr[self._cup_joint_id])
-        self._cup_body_id = self._name_id(mujoco.mjtObj.mjOBJ_BODY, "cup")
-        self._tool_body_id = self._name_id(mujoco.mjtObj.mjOBJ_BODY, "tool")
+        self._cup_body_id = self._name_id(mujoco.mjtObj.mjOBJ_BODY, self.config.cup_body_name)
+        self._tool_body_id = self._name_id(mujoco.mjtObj.mjOBJ_BODY, self.config.tool_body_name)
+        self._tool_site_id = (
+            self._name_id(mujoco.mjtObj.mjOBJ_SITE, self.config.tool_site_name)
+            if self.config.tool_site_name
+            else None
+        )
         self._geom_ids = {
-            name: self._name_id(mujoco.mjtObj.mjOBJ_GEOM, name)
-            for name in ("left_finger_pad", "right_finger_pad", "cup_geom", "table", "floor")
+            "left_finger": self._name_id(
+                mujoco.mjtObj.mjOBJ_GEOM, self.config.left_finger_geom_name
+            ),
+            "right_finger": self._name_id(
+                mujoco.mjtObj.mjOBJ_GEOM, self.config.right_finger_geom_name
+            ),
+            "cup": self._name_id(mujoco.mjtObj.mjOBJ_GEOM, self.config.cup_geom_name),
         }
+        self._support_geom_ids = {
+            name: self._name_id(mujoco.mjtObj.mjOBJ_GEOM, name)
+            for name in self.config.support_geom_names
+        }
+        self._camera_names = {
+            "side": self.config.side_camera_name,
+            "wrist": self.config.wrist_camera_name,
+        }
+        for camera_name in self._camera_names.values():
+            self._name_id(mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
         self._initial_cup_z = self.config.cup_reset_z
         self._success_streak = 0
         self._step_count = 0
@@ -230,19 +283,19 @@ class UR10eCupEnv(gym.Env):
         object_id = self._mujoco.mj_name2id(self.model, object_type, name)
         if object_id < 0:
             object_name = object_type.name.removeprefix("mjOBJ_").lower()
-            raise ValueError(
-                f"MJCF is missing required {object_name} {name!r}"
-            )
+            raise ValueError(f"MJCF is missing required {object_name} {name!r}")
         return int(object_id)
 
     def _render_camera(self, camera: str) -> np.ndarray:
-        self._renderer.update_scene(self.data, camera=camera)
+        self._renderer.update_scene(self.data, camera=self._camera_names[camera])
         return np.asarray(self._renderer.render(), dtype=np.uint8).copy()
 
     def _gripper_open_fraction(self) -> float:
-        joint_id = self._name_id(self._mujoco.mjtObj.mjOBJ_JOINT, "left_finger_joint")
-        qpos = float(self.data.qpos[self.model.jnt_qposadr[joint_id]])
-        return float(np.clip(qpos / 0.035, 0.0, 1.0))
+        gripper_qpos = self.data.qpos[self._gripper_qpos_addresses]
+        closed = np.asarray(self.config.gripper_closed_qpos, dtype=np.float64)
+        opened = np.asarray(self.config.gripper_open_qpos, dtype=np.float64)
+        fractions = (gripper_qpos - closed) / (opened - closed)
+        return float(np.clip(np.mean(fractions), 0.0, 1.0))
 
     def _observation(self) -> dict[str, Any]:
         return {
@@ -263,15 +316,19 @@ class UR10eCupEnv(gym.Env):
 
     def _task_metrics(self) -> dict[str, Any]:
         contacts = self._contact_pairs()
-        cup = self._geom_ids["cup_geom"]
-        left_contact = frozenset((cup, self._geom_ids["left_finger_pad"])) in contacts
-        right_contact = frozenset((cup, self._geom_ids["right_finger_pad"])) in contacts
+        cup = self._geom_ids["cup"]
+        left_contact = frozenset((cup, self._geom_ids["left_finger"])) in contacts
+        right_contact = frozenset((cup, self._geom_ids["right_finger"])) in contacts
         table_support = any(
-            frozenset((cup, self._geom_ids[name])) in contacts for name in ("table", "floor")
+            frozenset((cup, geom_id)) in contacts for geom_id in self._support_geom_ids.values()
         )
         cup_height = float(self.data.xpos[self._cup_body_id, 2])
         self._episode_max_cup_height = max(self._episode_max_cup_height, cup_height)
-        tool_position = self.data.xpos[self._tool_body_id].copy()
+        tool_position = (
+            self.data.site_xpos[self._tool_site_id].copy()
+            if self._tool_site_id is not None
+            else self.data.xpos[self._tool_body_id].copy()
+        )
         cup_position = self.data.xpos[self._cup_body_id].copy()
         tool_cup_distance = float(np.linalg.norm(tool_position - cup_position))
         lifted = cup_height >= self._initial_cup_z + self.config.lift_height_m
@@ -287,9 +344,11 @@ class UR10eCupEnv(gym.Env):
             | (arm > DATASET_ARM_HIGH + dataset_tolerance)
         )
         hardware_tolerance = self.config.hardware_joint_limit_tolerance_rad
-        hardware_violation_mask = (~finite_mask) | (
-            arm < self._hardware_arm_low - hardware_tolerance
-        ) | (arm > self._hardware_arm_high + hardware_tolerance)
+        hardware_violation_mask = (
+            (~finite_mask)
+            | (arm < self._hardware_arm_low - hardware_tolerance)
+            | (arm > self._hardware_arm_high + hardware_tolerance)
+        )
         dataset_violation_joints = [
             name
             for name, violated in zip(DATASET_JOINT_NAMES, dataset_violation_mask, strict=True)
@@ -337,6 +396,8 @@ class UR10eCupEnv(gym.Env):
             "step_count": int(self._step_count),
             "simulation_fidelity": self.config.simulation_fidelity,
             "calibration_verified": self.config.calibration_verified,
+            "calibration_source": self.config.calibration_source,
+            "model_sha256": self._model_sha256,
         }
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
@@ -353,14 +414,18 @@ class UR10eCupEnv(gym.Env):
             arm_noise[WRIST_2_INDEX] = 0.0
             arm = np.clip(DATASET_ARM_RESET + arm_noise, DATASET_ARM_LOW, DATASET_ARM_HIGH)
         self.data.qpos[self._joint_qpos_addresses] = arm
-        self.data.ctrl[:6] = arm
+        self.data.ctrl[self._arm_actuator_ids] = arm
         self._last_arm_target = arm.copy()
         gripper_open_fraction = float(options.get("gripper_open_fraction", 1.0))
         if not np.isfinite(gripper_open_fraction):
             raise ValueError("reset gripper_open_fraction must be finite")
         gripper_open_fraction = float(np.clip(gripper_open_fraction, 0.0, 1.0))
         self._last_gripper_target = gripper_open_fraction
-        self.data.ctrl[6:8] = 0.035 * gripper_open_fraction
+        gripper_closed = np.asarray(self.config.gripper_closed_ctrl, dtype=np.float64)
+        gripper_open = np.asarray(self.config.gripper_open_ctrl, dtype=np.float64)
+        self.data.ctrl[self._gripper_actuator_ids] = (
+            gripper_closed + (gripper_open - gripper_closed) * gripper_open_fraction
+        )
         if "cup_xy" in options:
             cup_xy = np.asarray(options["cup_xy"], dtype=np.float64).reshape(2)
             if not np.isfinite(cup_xy).all():
@@ -371,9 +436,20 @@ class UR10eCupEnv(gym.Env):
                 self.config.cup_reset_xy_noise,
                 size=2,
             )
+        cup_z = float(options.get("cup_z", self.config.cup_reset_z))
+        cup_quaternion = np.asarray(
+            options.get("cup_quaternion_wxyz", self.config.cup_reset_quaternion_wxyz),
+            dtype=np.float64,
+        ).reshape(4)
+        if not np.isfinite(cup_z) or not np.isfinite(cup_quaternion).all():
+            raise ValueError("reset cup pose contains non-finite values")
+        quaternion_norm = float(np.linalg.norm(cup_quaternion))
+        if quaternion_norm <= 1e-12:
+            raise ValueError("reset cup quaternion must have non-zero norm")
+        cup_quaternion /= quaternion_norm
         cup_pose = self.data.qpos[self._cup_qpos_address : self._cup_qpos_address + 7]
-        cup_pose[:3] = (cup_xy[0], cup_xy[1], self.config.cup_reset_z)
-        cup_pose[3:] = (1.0, 0.0, 0.0, 0.0)
+        cup_pose[:3] = (cup_xy[0], cup_xy[1], cup_z)
+        cup_pose[3:] = cup_quaternion
         self._mujoco.mj_forward(self.model, self.data)
         # Let the cup establish table contact and let the gravity-compensated
         # arm servo converge before exposing the first observation.  Settling
@@ -404,8 +480,12 @@ class UR10eCupEnv(gym.Env):
         arm_target[WRIST_2_INDEX] = self.data.qpos[self._joint_qpos_addresses[WRIST_2_INDEX]]
         self._last_arm_target = arm_target.copy()
         self._last_gripper_target = float(np.clip(gripper_target, 0.0, 1.0))
-        self.data.ctrl[:6] = arm_target
-        self.data.ctrl[6:8] = 0.035 * self._last_gripper_target
+        self.data.ctrl[self._arm_actuator_ids] = arm_target
+        gripper_closed = np.asarray(self.config.gripper_closed_ctrl, dtype=np.float64)
+        gripper_open = np.asarray(self.config.gripper_open_ctrl, dtype=np.float64)
+        self.data.ctrl[self._gripper_actuator_ids] = (
+            gripper_closed + (gripper_open - gripper_closed) * self._last_gripper_target
+        )
         for _ in range(self.config.physics_substeps):
             self._mujoco.mj_step(self.model, self.data)
         self._step_count += 1

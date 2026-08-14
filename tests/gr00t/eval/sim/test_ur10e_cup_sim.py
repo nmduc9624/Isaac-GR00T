@@ -38,22 +38,83 @@ def test_proxy_contract_is_20_hz_and_explicitly_uncalibrated():
 
 
 def test_calibrated_mode_rejects_missing_verification():
+    identity = tuple(np.eye(4).reshape(-1))
     with pytest.raises(ValueError, match="verified tool, camera, gripper, and scene"):
         UR10eCupSimConfig(
             simulation_fidelity="calibrated",
             model_xml_path="robot.xml",
+            calibration_source="measured-on-robot",
+            calibration_sha256="0" * 64,
+            tool_site_name="tcp",
+            base_to_world_matrix=identity,
+            tool0_to_tcp_matrix=identity,
+            side_camera_to_world_matrix=identity,
+            wrist_camera_to_tool_matrix=identity,
         ).validate()
 
 
+def test_calibrated_mode_rejects_missing_provenance():
+    with pytest.raises(ValueError, match="calibration_source"):
+        UR10eCupSimConfig(
+            simulation_fidelity="calibrated",
+            model_xml_path="robot.xml",
+            tool_transform_verified=True,
+            camera_calibration_verified=True,
+            gripper_calibration_verified=True,
+            scene_calibration_verified=True,
+        ).validate()
+
+
+def test_calibrated_mode_rejects_non_rigid_transform():
+    invalid_transform = tuple(np.zeros((4, 4)).reshape(-1))
+    with pytest.raises(ValueError, match="homogeneous bottom row"):
+        UR10eCupSimConfig._validate_rigid_transform("base_to_world_matrix", invalid_transform)
+
+
 def test_load_config_round_trip(tmp_path):
+    (tmp_path / "robot.xml").write_text("<mujoco/>", encoding="utf-8")
     config_path = tmp_path / "sim.json"
     config_path.write_text(
-        json.dumps({"cup_reset_xy": [-0.4, -0.2], "stable_success_steps": 7}),
+        json.dumps(
+            {
+                "cup_reset_xy": [-0.4, -0.2],
+                "cup_reset_quaternion_wxyz": [1, 0, 0, 0],
+                "model_xml_path": "robot.xml",
+                "arm_actuator_names": list(DATASET_JOINT_NAMES),
+                "support_geom_names": ["table", "floor"],
+                "stable_success_steps": 7,
+            }
+        ),
         encoding="utf-8",
     )
     config = load_sim_config(config_path)
     assert config.cup_reset_xy == (-0.4, -0.2)
+    assert config.model_xml_path == str((tmp_path / "robot.xml").resolve())
+    assert config.model_sha256 is not None
+    assert config.cup_reset_quaternion_wxyz == (1, 0, 0, 0)
+    assert config.arm_actuator_names == DATASET_JOINT_NAMES
+    assert config.support_geom_names == ("table", "floor")
     assert config.stable_success_steps == 7
+
+
+def test_rejects_ambiguous_gripper_calibration():
+    with pytest.raises(ValueError, match="each gripper open and closed"):
+        UR10eCupSimConfig(
+            gripper_closed_ctrl=(0.0, 0.0),
+            gripper_open_ctrl=(0.0, 0.035),
+        ).validate()
+
+
+def test_single_driver_gripper_contract_is_supported():
+    config = UR10eCupSimConfig(
+        gripper_joint_names=("finger_driver",),
+        gripper_actuator_names=("gripper",),
+        gripper_closed_ctrl=(0.0,),
+        gripper_open_ctrl=(255.0,),
+        gripper_closed_qpos=(0.8,),
+        gripper_open_qpos=(0.0,),
+    )
+    config.validate()
 
 
 def test_optional_mujoco_safe_hold_and_safety_taxonomy():
